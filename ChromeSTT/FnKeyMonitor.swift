@@ -5,8 +5,7 @@ final class FnKeyMonitor {
     private var runLoopSource: CFRunLoopSource?
     private var fnDown = false
 
-    var onPress: (() -> Void)?
-    var onRelease: (() -> Void)?
+    var onToggle: (() -> Void)?
 
     func start() {
         let mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
@@ -43,10 +42,9 @@ final class FnKeyMonitor {
         let isDown = event.flags.contains(.maskSecondaryFn)
         if isDown && !fnDown {
             fnDown = true
-            DispatchQueue.main.async { [weak self] in self?.onPress?() }
+            DispatchQueue.main.async { [weak self] in self?.onToggle?() }
         } else if !isDown && fnDown {
             fnDown = false
-            DispatchQueue.main.async { [weak self] in self?.onRelease?() }
         }
     }
 }
