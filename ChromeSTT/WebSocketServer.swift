@@ -6,13 +6,23 @@ import NIOWebSocket
 final class WebSocketServer {
     private var group: EventLoopGroup?
     private var channel: Channel?
-    private var wsChannel: Channel?
+
+    /// Every open page, not just the newest. Tracking one channel meant a second
+    /// tab silently displaced the first, and commands went to a tab whose mic was
+    /// never granted — the page looked connected while dictation returned
+    /// "not-allowed" from the wrong tab.
+    private var wsChannels: [ObjectIdentifier: Channel] = [:]
+
+    /// Tabs that reported a denied microphone. Kept so their failures do not
+    /// surface as errors while another tab is recording fine.
+    private var deniedChannels: Set<ObjectIdentifier> = []
+
     let port: Int
 
     var onTranscript: ((TranscriptEvent) -> Void)?
     var onConnectionChanged: ((Bool) -> Void)?
 
-    var isConnected: Bool { wsChannel?.isActive ?? false }
+    var isConnected: Bool { !wsChannels.isEmpty }
 
     init(port: Int = 9876) {
         self.port = port
@@ -33,17 +43,21 @@ final class WebSocketServer {
             },
             upgradePipelineHandler: { [weak self] channel, _ in
                 guard let self else { return channel.eventLoop.makeSucceededVoidFuture() }
+                let id = ObjectIdentifier(channel)
                 let handler = WebSocketHandler(
                     onEvent: { [weak self] ev in
-                        DispatchQueue.main.async { self?.onTranscript?(ev) }
+                        self?.route(ev, from: id)
                     },
                     onClose: { [weak self] in
                         guard let self else { return }
-                        if self.wsChannel === channel { self.wsChannel = nil }
-                        DispatchQueue.main.async { self.onConnectionChanged?(false) }
+                        self.wsChannels.removeValue(forKey: id)
+                        self.deniedChannels.remove(id)
+                        let connected = self.isConnected
+                        DispatchQueue.main.async { self.onConnectionChanged?(connected) }
                     }
                 )
-                self.wsChannel = channel
+                self.wsChannels[id] = channel
+                Log.write("ws: tab connected (\(self.wsChannels.count) open)")
                 DispatchQueue.main.async { self.onConnectionChanged?(true) }
                 return channel.pipeline.addHandler(handler)
             }
@@ -77,21 +91,40 @@ final class WebSocketServer {
     }
 
     func sendStart(lang: String) {
-        sendWS(text: #"{"cmd":"start","lang":"\#(lang)"}"#)
+        deniedChannels.removeAll()
+        broadcast(#"{"cmd":"start","lang":"\#(lang)"}"#)
     }
 
     func sendStop() {
-        sendWS(text: #"{"cmd":"stop"}"#)
+        broadcast(#"{"cmd":"stop"}"#)
     }
 
-    private func sendWS(text: String) {
-        guard let ch = wsChannel, ch.isActive else { return }
-        ch.eventLoop.execute {
-            var buffer = ch.allocator.buffer(capacity: text.utf8.count)
-            buffer.writeString(text)
-            let frame = WebSocketFrame(fin: true, opcode: .text, data: buffer)
-            ch.writeAndFlush(frame, promise: nil)
+    /// Commands go to every open page. Only the one whose microphone is granted
+    /// will actually record; the rest report back that they were denied.
+    private func broadcast(_ text: String) {
+        for ch in wsChannels.values where ch.isActive {
+            ch.eventLoop.execute {
+                var buffer = ch.allocator.buffer(capacity: text.utf8.count)
+                buffer.writeString(text)
+                let frame = WebSocketFrame(fin: true, opcode: .text, data: buffer)
+                ch.writeAndFlush(frame, promise: nil)
+            }
         }
+    }
+
+    /// Suppresses noise from tabs that cannot record, so one stale tab does not
+    /// abort a session another tab is handling fine.
+    private func route(_ event: TranscriptEvent, from id: ObjectIdentifier) {
+        if event.kind == .error, event.text == "not-allowed" {
+            deniedChannels.insert(id)
+            Log.write("ws: tab denied mic (\(deniedChannels.count)/\(wsChannels.count) denied)")
+            // Only surface the failure once no tab is left that could record.
+            guard deniedChannels.count >= wsChannels.count else { return }
+        }
+        if deniedChannels.contains(id), event.kind != .error {
+            return
+        }
+        DispatchQueue.main.async { self.onTranscript?(event) }
     }
 
     private func loadHTML() -> Data {
