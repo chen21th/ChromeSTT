@@ -1,5 +1,7 @@
 import Cocoa
+import ApplicationServices
 
+/// Monitors the Fn (🌐) key and fires onToggle on each press.
 final class FnKeyMonitor {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -8,6 +10,11 @@ final class FnKeyMonitor {
     var onToggle: (() -> Void)?
 
     func start() {
+        // Force macOS to register this app in Accessibility list + show prompt
+        let opts: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+        let trusted = AXIsProcessTrustedWithOptions(opts)
+        Log.write("Accessibility trusted = \(trusted)")
+
         let mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
 
         let callback: CGEventTapCallBack = { _, _, event, refcon in
