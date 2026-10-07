@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isListening = false
     private var language = "th-TH"
     private var accumulatedText = ""
+    private var serverError: Error?
 
     private var polishEnabled: Bool {
         get { UserDefaults.standard.bool(forKey: "polishEnabled") }
@@ -39,7 +40,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateMenu() {
         let menu = NSMenu()
-        let statusTitle = isListening ? "⏺ Listening..." : (server.isConnected ? "✅ Chrome Connected" : "⏳ Waiting for Chrome...")
+        let statusTitle: String
+        if serverError != nil {
+            statusTitle = "⚠️ Port \(server.port) in use"
+        } else if isListening {
+            statusTitle = "⏺ Listening..."
+        } else {
+            statusTitle = server.isConnected ? "✅ Chrome Connected" : "⏳ Waiting for Chrome..."
+        }
         menu.addItem(NSMenuItem(title: statusTitle, action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
 
@@ -84,9 +92,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if configured {
             let polishMenu = NSMenu()
             for p in available {
-                let exhausted = polisher.isQuotaExhausted(p)
+                let suffix = polisher.outage(for: p).map { " — \($0.summary)" } ?? ""
                 let item = NSMenuItem(
-                    title: exhausted ? "\(p.displayName) — quota used today" : p.displayName,
+                    title: p.displayName + suffix,
                     action: #selector(setProvider(_:)),
                     keyEquivalent: ""
                 )
@@ -94,11 +102,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 item.state = polisher.provider == p ? .on : .off
                 item.target = self
                 polishMenu.addItem(item)
-            }
-            if available.count > 1 {
-                let note = NSMenuItem(title: "Falls back to the other on 429", action: nil, keyEquivalent: "")
-                note.isEnabled = false
-                polishMenu.addItem(note)
             }
             polishMenu.addItem(.separator())
             let vocabItem = NSMenuItem(title: "Edit Vocabulary…", action: #selector(editVocabulary), keyEquivalent: "")
@@ -161,8 +164,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try server.start()
         } catch {
-            print("Failed to start server: \(error)")
+            // Usually a second copy already holding the port. Without this the
+            // app still shows its menu bar icon and looks healthy while nothing
+            // can ever connect.
+            serverError = error
+            Log.write("server failed to start on port \(server.port): \(error)")
+            DispatchQueue.main.async { [weak self] in self?.reportServerFailure(error) }
         }
+    }
+
+    private func reportServerFailure(_ error: Error) {
+        statusItem.button?.title = "⚠️"
+        updateMenu()
+
+        let alert = NSAlert()
+        alert.messageText = "ChromeSTT could not start"
+        alert.informativeText = """
+            Port \(server.port) is already in use — another copy of ChromeSTT is \
+            probably running. Quit it from its menu bar icon, then reopen this one.
+
+            (\(error.localizedDescription))
+            """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Quit")
+        alert.runModal()
+        NSApplication.shared.terminate(nil)
     }
 
     private func handleTranscript(_ event: TranscriptEvent) {

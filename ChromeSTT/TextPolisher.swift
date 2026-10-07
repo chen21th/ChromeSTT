@@ -23,10 +23,13 @@ final class TextPolisher {
             }
         }
 
+        /// Only ChromeSTT's own entries. Borrowing another project's key would
+        /// quietly bill whatever account sits behind it — a Gemini key from a
+        /// project with billing enabled is charged, not free.
         var keychainServices: [String] {
             switch self {
             case .deepseek: return ["ChromeSTT/DEEPSEEK_API_KEY"]
-            case .gemini:   return ["ChromeSTT/GEMINI_API_KEY", "CallyASMRVideo/GEMINI_API_KEY"]
+            case .gemini:   return ["ChromeSTT/GEMINI_API_KEY"]
             }
         }
     }
@@ -139,10 +142,12 @@ final class TextPolisher {
     func polish(_ raw: String, completion: @escaping (String) -> Void) {
         let ordered = [provider] + availableProviders.filter { $0 != provider }
         let configured = ordered.filter { apiKey(for: $0) != nil }
-        // A provider that already hit its cap today goes last, not away — if
-        // every provider is capped it is still worth one attempt.
-        let chain = configured.filter { !isQuotaExhausted($0) }
-                  + configured.filter { isQuotaExhausted($0) }
+        // A provider in a known outage goes to the back rather than away: once
+        // the backoff lapses the next call probes it again, so recovery needs no
+        // intervention. If every provider is down the attempt still happens and
+        // simply falls back to the raw transcript.
+        let chain = configured.filter { outage(for: $0) == nil }
+                  + configured.filter { outage(for: $0) != nil }
 
         guard !chain.isEmpty else {
             Log.write("polish: no API key in Keychain, pasting raw")
@@ -185,9 +190,9 @@ final class TextPolisher {
                 return
             }
             if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-                // 429 is the free-tier daily cap; 5xx is the provider wobbling.
-                // Both are worth retrying elsewhere.
-                if http.statusCode == 429 { self.markQuotaExhausted(p) }
+                if let outage = self.outage(forStatus: http.statusCode, provider: p) {
+                    self.noteOutage(outage, for: p)
+                }
                 fallThrough("HTTP \(http.statusCode)")
                 return
             }
@@ -211,24 +216,79 @@ final class TextPolisher {
         }.resume()
     }
 
-    // MARK: - Quota
+    // MARK: - Outages
 
-    /// Remembers that a provider hit its daily cap, so the rest of the day skips
-    /// it instead of paying a failed round-trip on every utterance. Clears on
-    /// its own once the date rolls over.
-    private func markQuotaExhausted(_ p: Provider) {
-        UserDefaults.standard.set(Self.today, forKey: "quotaExhausted.\(p.rawValue)")
-        Log.write("polish: \(p.displayName) hit its daily quota, skipping until tomorrow")
+    /// Why a provider is unavailable, and whether waiting will fix it.
+    ///
+    /// The two look alike over HTTP but need opposite handling. DeepSeek bills
+    /// from a prepaid balance: 402 means the money is gone and no amount of
+    /// waiting brings it back. Its 429 only means "slow down" — nothing to do
+    /// with a daily cap. Gemini's 429 *is* a daily cap that clears at midnight
+    /// Pacific, which is where the per-provider reset comes from.
+    struct Outage: Equatable {
+        enum Reason: String { case rateLimited, outOfCredit }
+        let reason: Reason
+        /// When to probe again. Every outage expires, so recovery — a top-up, a
+        /// quota rollover, a backoff elapsing — needs no intervention.
+        let retryAfter: Date
+
+        var summary: String {
+            switch reason {
+            case .outOfCredit:  return "out of credit"
+            case .rateLimited:  return "rate limited"
+            }
+        }
     }
 
-    func isQuotaExhausted(_ p: Provider) -> Bool {
-        UserDefaults.standard.string(forKey: "quotaExhausted.\(p.rawValue)") == Self.today
+    func outage(for p: Provider) -> Outage? {
+        let d = UserDefaults.standard
+        guard let raw = d.string(forKey: "outage.reason.\(p.rawValue)"),
+              let reason = Outage.Reason(rawValue: raw),
+              let retryAfter = d.object(forKey: "outage.retryAfter.\(p.rawValue)") as? Date
+        else { return nil }
+
+        guard retryAfter > Date() else {
+            clearOutage(for: p)
+            return nil
+        }
+        return Outage(reason: reason, retryAfter: retryAfter)
     }
 
-    private static var today: String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd"
-        return fmt.string(from: Date())
+    private func noteOutage(_ outage: Outage, for p: Provider) {
+        let d = UserDefaults.standard
+        d.set(outage.reason.rawValue, forKey: "outage.reason.\(p.rawValue)")
+        d.set(outage.retryAfter, forKey: "outage.retryAfter.\(p.rawValue)")
+        Log.write("polish: \(p.displayName) \(outage.summary), retrying after \(outage.retryAfter)")
+    }
+
+    func clearOutage(for p: Provider) {
+        let d = UserDefaults.standard
+        d.removeObject(forKey: "outage.reason.\(p.rawValue)")
+        d.removeObject(forKey: "outage.retryAfter.\(p.rawValue)")
+    }
+
+    private func outage(forStatus status: Int, provider p: Provider) -> Outage? {
+        switch (status, p) {
+        case (402, _):
+            // Prepaid balance is gone. Waiting will not refill it, but a top-up
+            // might happen any time, so re-probe rather than giving up for good.
+            return Outage(reason: .outOfCredit, retryAfter: Date().addingTimeInterval(30 * 60))
+        case (429, .deepseek):
+            // A pacing signal, not a quota — a short pause is enough.
+            return Outage(reason: .rateLimited, retryAfter: Date().addingTimeInterval(60))
+        case (429, .gemini):
+            return Outage(reason: .rateLimited, retryAfter: Self.nextPacificMidnight)
+        default:
+            return nil
+        }
+    }
+
+    /// Gemini's free-tier counter rolls over at midnight US Pacific.
+    private static var nextPacificMidnight: Date {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "America/Los_Angeles") ?? .current
+        let tomorrow = cal.date(byAdding: .day, value: 1, to: Date()) ?? Date().addingTimeInterval(86400)
+        return cal.startOfDay(for: tomorrow)
     }
 
     private func makeRequest(provider p: Provider, key: String, prompt: String) -> URLRequest? {
