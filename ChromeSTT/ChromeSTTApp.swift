@@ -84,11 +84,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if configured {
             let polishMenu = NSMenu()
             for p in available {
-                let item = NSMenuItem(title: p.displayName, action: #selector(setProvider(_:)), keyEquivalent: "")
+                let exhausted = polisher.isQuotaExhausted(p)
+                let item = NSMenuItem(
+                    title: exhausted ? "\(p.displayName) — quota used today" : p.displayName,
+                    action: #selector(setProvider(_:)),
+                    keyEquivalent: ""
+                )
                 item.representedObject = p.rawValue
                 item.state = polisher.provider == p ? .on : .off
                 item.target = self
                 polishMenu.addItem(item)
+            }
+            if available.count > 1 {
+                let note = NSMenuItem(title: "Falls back to the other on 429", action: nil, keyEquivalent: "")
+                note.isEnabled = false
+                polishMenu.addItem(note)
             }
             polishMenu.addItem(.separator())
             let vocabItem = NSMenuItem(title: "Edit Vocabulary…", action: #selector(editVocabulary), keyEquivalent: "")

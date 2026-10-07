@@ -130,15 +130,34 @@ final class TextPolisher {
 
     // MARK: - Polish
 
-    /// Calls back with the polished text, or `raw` unchanged if the provider is
-    /// unconfigured, too slow, or returns something suspect.
+    /// Calls back with the polished text, or `raw` unchanged if no provider is
+    /// configured, all are too slow, or the result looks suspect.
+    ///
+    /// Gemini's free tier caps at a daily request count and then returns 429.
+    /// Rather than degrade to raw text for the rest of the day, fall through to
+    /// the next configured provider — free first, paid as the backstop.
     func polish(_ raw: String, completion: @escaping (String) -> Void) {
-        let p = provider
-        guard let key = apiKey(for: p) else {
-            Log.write("polish: no \(p.displayName) key in Keychain, pasting raw")
+        let ordered = [provider] + availableProviders.filter { $0 != provider }
+        let configured = ordered.filter { apiKey(for: $0) != nil }
+        // A provider that already hit its cap today goes last, not away — if
+        // every provider is capped it is still worth one attempt.
+        let chain = configured.filter { !isQuotaExhausted($0) }
+                  + configured.filter { isQuotaExhausted($0) }
+
+        guard !chain.isEmpty else {
+            Log.write("polish: no API key in Keychain, pasting raw")
             completion(raw)
             return
         }
+        attempt(chain, raw: raw, completion: completion)
+    }
+
+    private func attempt(_ chain: [Provider], raw: String, completion: @escaping (String) -> Void) {
+        guard let p = chain.first, let key = apiKey(for: p) else {
+            completion(raw)
+            return
+        }
+        let rest = Array(chain.dropFirst())
 
         guard let request = makeRequest(provider: p, key: key, prompt: buildPrompt(for: raw)) else {
             completion(raw)
@@ -146,31 +165,43 @@ final class TextPolisher {
         }
 
         let started = Date()
-        session.dataTask(with: request) { data, response, error in
-            let elapsed = Date().timeIntervalSince(started)
-            let stamp = String(format: "%.2f", elapsed)
+        session.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { completion(raw); return }
+            let stamp = String(format: "%.2f", Date().timeIntervalSince(started))
+
+            /// Tries the next provider if there is one, otherwise pastes raw.
+            func fallThrough(_ reason: String) {
+                if rest.isEmpty {
+                    Log.write("polish: \(p.displayName) \(reason) after \(stamp)s, pasting raw")
+                    completion(raw)
+                } else {
+                    Log.write("polish: \(p.displayName) \(reason) after \(stamp)s → trying \(rest[0].displayName)")
+                    self.attempt(rest, raw: raw, completion: completion)
+                }
+            }
 
             if let error {
-                Log.write("polish: \(p.displayName) failed after \(stamp)s — \(error.localizedDescription)")
-                completion(raw)
+                fallThrough("failed (\(error.localizedDescription))")
                 return
             }
             if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-                Log.write("polish: \(p.displayName) HTTP \(http.statusCode) after \(stamp)s")
-                completion(raw)
+                // 429 is the free-tier daily cap; 5xx is the provider wobbling.
+                // Both are worth retrying elsewhere.
+                if http.statusCode == 429 { self.markQuotaExhausted(p) }
+                fallThrough("HTTP \(http.statusCode)")
                 return
             }
             guard let data, let text = Self.extractText(provider: p, data: data) else {
-                Log.write("polish: \(p.displayName) unexpected response, pasting raw")
-                completion(raw)
+                fallThrough("unexpected response")
                 return
             }
 
             let polished = text.trimmingCharacters(in: .whitespacesAndNewlines)
             // A result far shorter than the input means content was dropped;
-            // the raw transcript is the safer paste.
+            // the raw transcript is the safer paste. Another provider is
+            // unlikely to do better, so stop here.
             guard !polished.isEmpty, polished.count >= raw.count / 2 else {
-                Log.write("polish: result looks truncated (\(polished.count) vs \(raw.count)), pasting raw")
+                Log.write("polish: \(p.displayName) result looks truncated (\(polished.count) vs \(raw.count)), pasting raw")
                 completion(raw)
                 return
             }
@@ -178,6 +209,26 @@ final class TextPolisher {
             Log.write("polish: \(p.displayName) ok in \(stamp)s")
             completion(polished)
         }.resume()
+    }
+
+    // MARK: - Quota
+
+    /// Remembers that a provider hit its daily cap, so the rest of the day skips
+    /// it instead of paying a failed round-trip on every utterance. Clears on
+    /// its own once the date rolls over.
+    private func markQuotaExhausted(_ p: Provider) {
+        UserDefaults.standard.set(Self.today, forKey: "quotaExhausted.\(p.rawValue)")
+        Log.write("polish: \(p.displayName) hit its daily quota, skipping until tomorrow")
+    }
+
+    func isQuotaExhausted(_ p: Provider) -> Bool {
+        UserDefaults.standard.string(forKey: "quotaExhausted.\(p.rawValue)") == Self.today
+    }
+
+    private static var today: String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.string(from: Date())
     }
 
     private func makeRequest(provider p: Provider, key: String, prompt: String) -> URLRequest? {
