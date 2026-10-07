@@ -37,6 +37,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let statusTitle = isListening ? "⏺ Listening..." : (server.isConnected ? "✅ Chrome Connected" : "⏳ Waiting for Chrome...")
         menu.addItem(NSMenuItem(title: statusTitle, action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
+
+        let recordItem = NSMenuItem(
+            title: isListening ? "⏹  Stop & Paste" : "⏺  Start Recording",
+            action: #selector(toggleFromMenu),
+            keyEquivalent: "r"
+        )
+        recordItem.target = self
+        recordItem.isEnabled = server.isConnected
+        menu.addItem(recordItem)
+
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Open Chrome Tab", action: #selector(openChromeTab), keyEquivalent: "o"))
 
         let langMenu = NSMenu()
@@ -54,6 +65,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
+    }
+
+    @objc private func toggleFromMenu() {
+        Log.write("menu record item clicked")
+        toggleListening()
     }
 
     @objc private func setLanguage(_ sender: NSMenuItem) {
