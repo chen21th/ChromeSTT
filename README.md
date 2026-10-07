@@ -31,11 +31,43 @@ cp .build/release/ChromeSTT "$APP/Contents/MacOS/"
 1. Launch `ChromeSTT.app` (menu bar icon 🎙 appears)
 2. Open Chrome at `http://127.0.0.1:9876`
 3. Allow microphone access when Chrome asks
-4. Grant Accessibility permission to ChromeSTT (System Settings → Privacy & Security → Accessibility) so it can detect the Fn key and paste
+4. Grant **both** permissions in System Settings → Privacy & Security:
+   - **Accessibility** — lets the app post the paste keystroke
+   - **Input Monitoring** — lets it observe the Fn key
+
+   These are separate services. With only Accessibility the app pastes fine but
+   the hotkey never fires, because macOS disables the event tap within seconds.
 5. Put cursor anywhere, press **Fn**, speak, press **Fn** → text pastes
 
-Change language from the menu bar: 🎙 → Language → Thai / English / Japanese / Chinese / Korean
+Change language from the menu bar: 🎙 → Language → Thai / English / Japanese / Chinese / Korean.
+The menu also has a Start/Stop item, which works while Secure Input is held (any
+password field) and no event tap can fire.
 
-## Why
+## Polish (optional)
 
-Replaces paid cloud STT APIs (Deepgram, Whisper API, etc.) for personal dictation. Trade-off: must keep Chrome tab open; audio goes through Google's servers.
+A second pass sends the raw transcript to an LLM to fix mis-heard words, drop
+filler, and add the spacing Thai speech-to-text omits. Off by default; toggle
+with `⌘P` or 🎙 → ✨ Polish.
+
+Most of the value is in the vocabulary file at `~/.config/chromestt/vocabulary.txt`
+— terms you say often that STT mangles. Without it, "อาเอสไอ" becomes "AIS", the
+telecom; with it, "RSI". Edits apply on the next utterance, no restart.
+
+API keys are read from the Keychain at runtime, never stored in the repo:
+
+```bash
+security add-generic-password -U -s "ChromeSTT/DEEPSEEK_API_KEY" -a ChromeSTT -w "YOUR_KEY"
+security add-generic-password -U -s "ChromeSTT/GEMINI_API_KEY"   -a ChromeSTT -w "YOUR_KEY"
+```
+
+Pick a provider under 🎙 → Polish Settings. On Thai trading jargon DeepSeek ran
+faster (~0.6-1.0s vs ~1.0-1.5s) and transliterated better. Calls are bounded at
+5s and fall back to the raw transcript on timeout, error, or a result that lost
+more than half the input — a slightly rough paste beats one that never lands.
+
+## Trade-offs
+
+- One Chrome tab must stay open.
+- Audio goes to Google's servers (same path as voice search).
+- With Polish on, the transcript also goes to DeepSeek or Google, and pasting is
+  ~0.6-1.5s slower. Turn it off for anything sensitive.

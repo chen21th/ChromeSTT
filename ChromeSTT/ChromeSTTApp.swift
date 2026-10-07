@@ -19,6 +19,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var language = "th-TH"
     private var accumulatedText = ""
 
+    private var polishEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "polishEnabled") }
+        set { UserDefaults.standard.set(newValue, forKey: "polishEnabled") }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusBar()
         setupServer()
@@ -62,9 +67,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         langItem.submenu = langMenu
         menu.addItem(langItem)
 
+        let polisher = TextPolisher.shared
+        let available = polisher.availableProviders
+        let configured = !available.isEmpty
+
+        let polishItem = NSMenuItem(
+            title: configured ? "✨  Polish (\(polisher.provider.displayName))" : "✨  Polish (no API key)",
+            action: #selector(togglePolish),
+            keyEquivalent: "p"
+        )
+        polishItem.target = self
+        polishItem.state = (polishEnabled && configured) ? .on : .off
+        polishItem.isEnabled = configured
+        menu.addItem(polishItem)
+
+        if configured {
+            let polishMenu = NSMenu()
+            for p in available {
+                let item = NSMenuItem(title: p.displayName, action: #selector(setProvider(_:)), keyEquivalent: "")
+                item.representedObject = p.rawValue
+                item.state = polisher.provider == p ? .on : .off
+                item.target = self
+                polishMenu.addItem(item)
+            }
+            polishMenu.addItem(.separator())
+            let vocabItem = NSMenuItem(title: "Edit Vocabulary…", action: #selector(editVocabulary), keyEquivalent: "")
+            vocabItem.target = self
+            polishMenu.addItem(vocabItem)
+
+            let polishSub = NSMenuItem(title: "Polish Settings", action: nil, keyEquivalent: "")
+            polishSub.submenu = polishMenu
+            menu.addItem(polishSub)
+        }
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
+    }
+
+    @objc private func togglePolish() {
+        polishEnabled.toggle()
+        Log.write("polish toggled → \(polishEnabled)")
+        updateMenu()
+    }
+
+    @objc private func setProvider(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let p = TextPolisher.Provider(rawValue: raw) else { return }
+        TextPolisher.shared.provider = p
+        Log.write("polish provider → \(p.displayName)")
+        updateMenu()
+    }
+
+    @objc private func editVocabulary() {
+        let url = TextPolisher.vocabularyURL
+        if !FileManager.default.fileExists(atPath: url.path) {
+            // Touch it so the polisher writes its default, then open that.
+            _ = TextPolisher.shared.isConfigured()
+        }
+        NSWorkspace.shared.open(url)
     }
 
     @objc private func toggleFromMenu() {
@@ -100,14 +161,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .final:
             accumulatedText = event.text
         case .ended:
-            Log.write("ended → paste='\(accumulatedText)'")
-            if !accumulatedText.isEmpty {
-                CursorPaster.paste(accumulatedText)
-                accumulatedText = ""
-            }
+            let text = accumulatedText
+            accumulatedText = ""
             isListening = false
-            statusItem.button?.title = "🎙"
-            updateMenu()
+            Log.write("ended → '\(text)'")
+
+            guard !text.isEmpty else {
+                statusItem.button?.title = "🎙"
+                updateMenu()
+                return
+            }
+
+            if polishEnabled && TextPolisher.shared.isConfigured() {
+                statusItem.button?.title = "✨"
+                updateMenu()
+                TextPolisher.shared.polish(text) { [weak self] result in
+                    DispatchQueue.main.async {
+                        CursorPaster.paste(result)
+                        self?.statusItem.button?.title = "🎙"
+                        self?.updateMenu()
+                    }
+                }
+            } else {
+                CursorPaster.paste(text)
+                statusItem.button?.title = "🎙"
+                updateMenu()
+            }
         case .partial:
             break
         case .error:
