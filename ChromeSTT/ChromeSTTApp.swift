@@ -103,29 +103,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupHotKey() {
-        fnMonitor.onToggle = { [weak self] in
-            self?.toggleListening()
-        }
+        fnMonitor.onPress = { [weak self] in self?.startListening() }
+        fnMonitor.onRelease = { [weak self] in self?.stopListening() }
         fnMonitor.start()
     }
 
-    private func toggleListening() {
-        Log.write("hotkey pressed, isListening=\(isListening), connected=\(server.isConnected)")
-        if isListening {
-            server.sendStop()
-            isListening = false
-            statusItem.button?.title = "🎙"
-        } else {
-            guard server.isConnected else {
-                Log.write("not connected, opening Chrome tab")
-                openChromeTab()
-                return
-            }
-            accumulatedText = ""
-            server.sendStart(lang: language)
-            isListening = true
-            statusItem.button?.title = "⏺"
+    private func startListening() {
+        Log.write("Fn pressed, isListening=\(isListening), connected=\(server.isConnected)")
+        guard !isListening else { return }
+        guard server.isConnected else {
+            Log.write("not connected, opening Chrome tab")
+            openChromeTab()
+            return
         }
+        accumulatedText = ""
+        server.sendStart(lang: language)
+        isListening = true
+        statusItem.button?.title = "⏺"
+        updateMenu()
+    }
+
+    private func stopListening() {
+        Log.write("Fn released, isListening=\(isListening)")
+        guard isListening else { return }
+        server.sendStop()
+        isListening = false
+        statusItem.button?.title = "🎙"
         updateMenu()
     }
 
